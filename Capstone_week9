@@ -1,0 +1,83 @@
+# Capstone Week 9 Update — ML Component
+
+**Component added:** Predictive maintenance risk model (equipment failure prediction), trained on
+the real Microsoft Azure Predictive Maintenance dataset — 100 machines, hourly telemetry over one
+full year, real error logs, maintenance records, and recorded component failures. Includes
+cross-validated training, imbalance handling, evaluation, K-Means machine segmentation, and
+SHAP-based explainability. See `week9_operational_ml.ipynb` for the full implementation.
+
+---
+
+## 1. Which ML algorithm did I choose, and why?
+
+I trained and compared **Random Forest** and **XGBoost**, and selected **XGBoost** for the final
+explainability pipeline based on held-out test performance (ROC-AUC 0.9999 vs. 0.9996, and
+notably better precision at the default threshold: 97.2% vs. 82.6%).
+
+Reasons for choosing tree ensembles here specifically:
+
+- **No heavy feature engineering required for non-linear interactions.** Sensor drift, error-code
+  bursts, and maintenance recency interact non-linearly (e.g. a small vibration increase matters
+  more when a component is also overdue for service). Trees capture this natively.
+- **Exact, fast explainability.** Both models are fully supported by SHAP's `TreeExplainer`, which
+  computes exact Shapley values for tree ensembles — important for a report going to a
+  non-technical operations audience.
+- **XGBoost's histogram algorithm scales well.** At ~220,000 training rows on a single CPU core,
+  XGBoost trained in a few seconds per fit versus roughly a minute for Random Forest at comparable
+  settings — a genuinely important practical consideration once real telemetry volumes get large,
+  not just an accuracy question.
+
+## 2. How did I handle class imbalance?
+
+Only about **2.3%** of the 3-hour machine-snapshots in this dataset are followed by a real failure
+within 24 hours — realistic and, if anything, more imbalanced than a synthetic classroom example.
+I used two complementary approaches, but made a deliberate choice about which one to rely on:
+
+- **Class weighting** (`class_weight='balanced'` for Random Forest, `scale_pos_weight` for
+  XGBoost) as the **primary** technique, used inside a proper `TimeSeriesSplit` cross-validation
+  loop and for the final models. This reweights the loss function directly with no extra training
+  rows, which matters at this data volume.
+- **SMOTE**, run as a direct comparison: it roughly doubled the training set (218K → 426K rows)
+  and reached essentially the same test performance as class weighting for XGBoost, but took
+  noticeably longer to fit for Random Forest with no meaningful accuracy benefit.
+- I evaluated everything on **precision, recall, F1, and ROC-AUC**, never accuracy alone, since a
+  model that always predicts "no failure" would already score ~98% accuracy while catching zero
+  real failures.
+
+This produced a concrete, evidence-based engineering conclusion for the capstone: **class
+weighting is the more efficient choice for this data volume**; SMOTE remains a good option for
+smaller datasets or model families without a native class-weight parameter.
+
+## 3. One insight from Feature Importance that surprised me
+
+The expected story — that raw sensor drift (vibration, pressure) matters — held up, but not quite
+in the form I expected. It wasn't a *single point-in-time reading* that dominated; it was the
+**24-hour rolling average** of pressure, vibration, voltage, and rotation speed, essentially tied
+with each other at the top of both the feature importance ranking and the SHAP summary. Right
+behind that group came the **count of recent error codes** in the past 24 hours — a signal I
+expected to be a minor contributor, but which turned out to rival the sensor trends themselves,
+and which actually dominates the *local* explanation for the single most confident real flagged
+case in the test set (Machine 15, correctly flagged before a real comp2 failure, driven mainly by
+a burst of error5/error2/error3 codes plus a rotation-speed uptick — see the notebook's SHAP
+force plot).
+
+This was a useful reminder that **global** importance and a **local**, single-machine explanation
+can tell related but different stories — the fleet-wide pattern says "watch the sensor trend
+lines," but the most useful single alert in my test set was actually driven more by error codes.
+An operations team should look at both, not assume the global pattern applies to every flagged
+machine.
+
+**A second, more sobering observation:** both models achieved near-perfect scores (ROC-AUC >
+0.999). I checked carefully for data leakage (all features are built from strictly backward-looking
+windows, and the train/test split is chronological) and found none — this appears to be a genuine
+property of this specific, well-known public benchmark dataset, which has cleaner synthetic failure
+signatures than real plant sensor data typically does. I'm flagging this explicitly in both the
+notebook and the written report so the numbers aren't mistaken for a promise about real-world
+performance.
+
+---
+
+**Next steps for the capstone repo:** replace this benchmark dataset with real plant telemetry
+once available, re-run the same feature-engineering and modeling pipeline, and specifically expect
+(and re-validate against) lower precision/recall than reported here, since real sensor data is
+noisier than this synthetic benchmark.
